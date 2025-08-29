@@ -4,10 +4,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
+	"sync/atomic"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
+
+// var lastsequencenumber int
+var heartbeatrecieved int32
+var sequencenumber int64
 
 func main() {
 	defer fmt.Println("Program exited")
@@ -50,7 +57,7 @@ func main() {
 
 	fmt.Println("Connected to discord gateway")
 
-	var heartbeat struct {
+	var hello struct {
 		OP int `json:"op"`
 		D  struct {
 			HeartbeatInterval int `json:"heartbeat_interval"`
@@ -64,18 +71,91 @@ func main() {
 				fmt.Println("read:", err)
 			}
 
-			err = json.Unmarshal(message, &heartbeat)
+			err = json.Unmarshal(message, &hello)
 			if err != nil {
 				fmt.Println("Something has gone bad bad very bad", err)
-			} else if heartbeat.OP == 10 {
+			} else if hello.OP == 10 {
 				fmt.Println("Hello event processed")
 				return
 			}
 		}
 	}()
-	fmt.Println("Exiting")
 
-	//this is slightly inspired from gorilla/websocket example code
-	done := make(chan struct{})
-	defer close(done)
+	fmt.Println(hello.D.HeartbeatInterval)
+	go func() {
+		time.Sleep(time.Duration(float64(hello.D.HeartbeatInterval)*rand.Float64()) * time.Millisecond)
+		fmt.Println("heartbeat")
+		heartbeaterr := connection.WriteMessage(websocket.TextMessage, []byte(`{"op":1,"d":null}`))
+		if heartbeaterr != nil {
+			fmt.Println("Technically this is handling the error")
+		}
+
+		for {
+			time.Sleep(time.Duration(float64(hello.D.HeartbeatInterval)) * time.Millisecond)
+
+			if atomic.LoadInt32(&heartbeatrecieved) == 0 {
+				println("At this point, this is where you know its over.")
+				return
+			}
+
+			var heartbeaterr error
+			fmt.Println("sending heartbeat")
+			if atomic.LoadInt64(&sequencenumber) == 0 {
+				heartbeaterr = connection.WriteMessage(websocket.TextMessage, []byte(`{"op":1,"d":null}`))
+			} else {
+				heartbeaterr = connection.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"op":1,"d":%d}`, atomic.LoadInt64(&sequencenumber))))
+			}
+			if heartbeaterr != nil {
+				fmt.Println("Technically this is handling the error")
+			}
+			atomic.StoreInt32(&heartbeatrecieved, 0)
+		}
+	}()
+
+	// Reading loop below:
+	go func() {
+		for {
+			var event struct {
+				OP int    `json:"op"`
+				D  any    `json:"d"`
+				S  int    `json:"s"`
+				T  string `json:"t"`
+			}
+			readerr := connection.ReadJSON(&event)
+			if readerr != nil {
+				fmt.Println("Idk not my problem (actually it is my problem)", readerr)
+				return
+			}
+
+			switch event.OP {
+			case 11:
+				atomic.StoreInt32(&heartbeatrecieved, 1)
+				fmt.Println("heartbeat recieved")
+			case 1:
+				fmt.Println("Spanish Inquisition apparently")
+				var heartbeaterr error
+				if atomic.LoadInt64(&sequencenumber) == 0 {
+					heartbeaterr = connection.WriteMessage(websocket.TextMessage, []byte(`{"op":1,"d":null}`))
+				} else {
+					heartbeaterr = connection.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"op":1,"d":%d}`, atomic.LoadInt64(&sequencenumber))))
+				}
+
+				if heartbeaterr != nil {
+					fmt.Println("Technically this is handling the error")
+				}
+			case 0:
+				print(event.OP, event.D, event.S, event.T)
+			}
+			fmt.Println("a", event.OP)
+
+			if event.S != 0 {
+				atomic.StoreInt64(&sequencenumber, int64(event.S))
+			}
+
+		}
+	}()
+
+	for {
+		time.Sleep(500)
+	}
 }
