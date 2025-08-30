@@ -8,15 +8,25 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
+const useragent string = "DiscordBot (https://github.com/Something231/Go-Discord-Bot, 0.0.1)"
+
 // var lastsequencenumber int
 var heartbeatrecieved int32
 var sequencenumber int64
+
+var session_id string
+var resume_gateway_url string
+var guilds []string
+var apiversion int
+
+var token string
 
 func main() {
 	defer fmt.Println("Program exited")
@@ -130,6 +140,8 @@ func main() {
 						ID          string `json:"id"`
 						UNAVAILABLE bool   `json:"guilds"`
 					} `json:"guilds"`
+					CONTENT   string `json:"content"`
+					CHANNELID string `json:"channel_id"`
 				} `json:"d"`
 				S int    `json:"s"`
 				T string `json:"t"`
@@ -150,17 +162,57 @@ func main() {
 				if atomic.LoadInt64(&sequencenumber) == 0 {
 					heartbeaterr = connection.WriteMessage(websocket.TextMessage, []byte(`{"op":1,"d":null}`))
 				} else {
-					heartbeaterr = connection.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"op":1,"d":%d}`, atomic.LoadInt64(&sequencenumber))))
+					heartbeaterr = connection.WriteMessage(websocket.TextMessage, fmt.Appendf(nil, `{"op":1,"d":%d}`, atomic.LoadInt64(&sequencenumber)))
 				}
 
 				if heartbeaterr != nil {
 					fmt.Println("Technically this is handling the error")
 				}
 			case 0:
-				print(event.OP, event.S, event.T)
+				fmt.Println(event.T)
 				if event.T == "READY" {
-					fmt.Printf("\nSigned in as %v#%v\n", event.D.USER.USERNAME, event.D.USER.DISCRIMINATOR)
+					apiversion = event.D.APIVERSION
+					session_id = event.D.SESSIONID
+					resume_gateway_url = event.D.RESUMEURL
+					for _, guild := range event.D.GUILDS {
+						fmt.Println(guild.ID)
+						guilds = append(guilds, guild.ID)
+					}
+					fmt.Printf("Signed in as %v#%v\n", event.D.USER.USERNAME, event.D.USER.DISCRIMINATOR)
+				} else if event.T == "MESSAGE_CREATE" {
+					fmt.Println(event.D.CONTENT)
+					if event.D.CONTENT == "e" {
+						var message struct {
+							CONTENT string `json:"content"`
+						}
+						message.CONTENT = "Hello?"
+						jsonmessage, jsonerr := json.Marshal(message)
+						if jsonerr != nil {
+							fmt.Println("Failed to convert message to json.")
+						}
+						request, httperr := http.NewRequest("POST", ("https://discord.com/api/channels/" + event.D.CHANNELID + "/messages"), strings.NewReader(string(jsonmessage)))
+						if httperr != nil {
+							fmt.Println("Http Error")
+						}
+						request.Header.Set("Content-Type", "application/json")
+						request.Header.Set("Authorization", ("Bot " + token))
+						request.Header.Set("User-Agent", useragent)
+
+						response, httperr = http.DefaultClient.Do(request)
+						if httperr != nil {
+							fmt.Println("Failed to send message")
+						}
+
+						if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusCreated {
+							fmt.Printf("Failed to send message: %s\n", response.Status)
+						} else {
+							fmt.Println("Message sent successfully!")
+						}
+						response.Body.Close()
+					}
 				}
+			case 9:
+				fmt.Println("Invalid Session Error Has occured")
 
 			}
 			fmt.Println("Event Confirmed; OP CODE:", event.OP)
@@ -187,7 +239,7 @@ func main() {
 	}
 
 	identifypayload.OP = 2
-	identifypayload.D.INTENTS = 8
+	identifypayload.D.INTENTS = 131071
 	identifypayload.D.PROPERTIES.OS = "linux"
 	identifypayload.D.PROPERTIES.BROWSER = "my_library"
 	identifypayload.D.PROPERTIES.DEVICE = "my_library"
@@ -197,6 +249,7 @@ func main() {
 		fmt.Println("Error reading token file. Set token in token.txt.")
 	}
 	identifypayload.D.TOKEN = string(tokendata)
+	token = string(tokendata)
 
 	err = connection.WriteJSON(identifypayload)
 	if err != nil {
