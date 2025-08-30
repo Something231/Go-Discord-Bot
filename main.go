@@ -1,3 +1,4 @@
+// Token should be stored in token.txt
 package main
 
 import (
@@ -6,6 +7,7 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"os"
 	"sync/atomic"
 	"time"
 
@@ -81,10 +83,9 @@ func main() {
 		}
 	}()
 
-	fmt.Println(hello.D.HeartbeatInterval)
 	go func() {
 		time.Sleep(time.Duration(float64(hello.D.HeartbeatInterval)*rand.Float64()) * time.Millisecond)
-		fmt.Println("heartbeat")
+		fmt.Println("initial heartbeat")
 		heartbeaterr := connection.WriteMessage(websocket.TextMessage, []byte(`{"op":1,"d":null}`))
 		if heartbeaterr != nil {
 			fmt.Println("Technically this is handling the error")
@@ -116,10 +117,22 @@ func main() {
 	go func() {
 		for {
 			var event struct {
-				OP int    `json:"op"`
-				D  any    `json:"d"`
-				S  int    `json:"s"`
-				T  string `json:"t"`
+				OP int `json:"op"`
+				D  struct {
+					APIVERSION int    `json:"v"`
+					SESSIONID  string `json:"session_id"`
+					RESUMEURL  string `json:"resume_gateway_url"`
+					USER       struct {
+						USERNAME      string `json:"username"`
+						DISCRIMINATOR string `json:"discriminator"`
+					} `json:"user"`
+					GUILDS []struct {
+						ID          string `json:"id"`
+						UNAVAILABLE bool   `json:"guilds"`
+					} `json:"guilds"`
+				} `json:"d"`
+				S int    `json:"s"`
+				T string `json:"t"`
 			}
 			readerr := connection.ReadJSON(&event)
 			if readerr != nil {
@@ -144,16 +157,51 @@ func main() {
 					fmt.Println("Technically this is handling the error")
 				}
 			case 0:
-				print(event.OP, event.D, event.S, event.T)
+				print(event.OP, event.S, event.T)
+				if event.T == "READY" {
+					fmt.Printf("\nSigned in as %v#%v\n", event.D.USER.USERNAME, event.D.USER.DISCRIMINATOR)
+				}
+
 			}
-			fmt.Println("a", event.OP)
+			fmt.Println("Event Confirmed; OP CODE:", event.OP)
 
 			if event.S != 0 {
 				atomic.StoreInt64(&sequencenumber, int64(event.S))
+				fmt.Println("Sequence Updated", sequencenumber)
 			}
 
 		}
 	}()
+
+	var identifypayload struct {
+		OP int `json:"op"`
+		D  struct {
+			TOKEN      string `json:"token"`
+			INTENTS    int    `json:"intents"`
+			PROPERTIES struct {
+				OS      string `json:"os"`
+				BROWSER string `json:"browser"`
+				DEVICE  string `json:"device"`
+			} `json:"properties"`
+		} `json:"d"`
+	}
+
+	identifypayload.OP = 2
+	identifypayload.D.INTENTS = 8
+	identifypayload.D.PROPERTIES.OS = "linux"
+	identifypayload.D.PROPERTIES.BROWSER = "my_library"
+	identifypayload.D.PROPERTIES.DEVICE = "my_library"
+
+	tokendata, err := os.ReadFile("token.txt")
+	if err != nil {
+		fmt.Println("Error reading token file. Set token in token.txt.")
+	}
+	identifypayload.D.TOKEN = string(tokendata)
+
+	err = connection.WriteJSON(identifypayload)
+	if err != nil {
+		fmt.Println("its so over")
+	}
 
 	for {
 		time.Sleep(500)
