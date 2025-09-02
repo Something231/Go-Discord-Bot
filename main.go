@@ -28,12 +28,14 @@ var apiversion int
 
 var token string
 
-func main() {
-	defer fmt.Println("Program exited")
+var gateway struct {
+	URL string `json:"url"`
+}
+
+func get_gateway() {
 	response, err := http.Get("https://discord.com/api/gateway")
 	if err != nil {
-		fmt.Println("Request Failed")
-		return
+		fmt.Println("Request to discord servers failed.")
 	}
 
 	defer response.Body.Close()
@@ -44,28 +46,21 @@ func main() {
 	}
 	if err != nil {
 		fmt.Println(err)
-		return
 	}
 
-	var gateway struct {
-		URL string `json:"url"`
-	}
 	err = json.Unmarshal(body, &gateway)
 
 	if err != nil {
 		fmt.Println(err)
-		return
 	}
+}
 
-	fmt.Println(gateway.URL)
-
-	connection, response, err := websocket.DefaultDialer.Dial(gateway.URL+"/?v=10&encoding=json", nil)
+func open_connection() (int, *websocket.Conn) {
+	connection, _, err := websocket.DefaultDialer.Dial(gateway.URL+"/?v=10&encoding=json", nil)
 
 	if err != nil {
 		fmt.Println("Failed to connect to gateway :(")
-		return
 	}
-	defer connection.Close()
 
 	fmt.Println("Connected to discord gateway")
 
@@ -76,154 +71,158 @@ func main() {
 		} `json:"d"`
 	}
 
-	func() {
-		for {
-			_, message, err := connection.ReadMessage()
-			if err != nil {
-				fmt.Println("read:", err)
-			}
-
-			err = json.Unmarshal(message, &hello)
-			if err != nil {
-				fmt.Println("Something has gone bad bad very bad", err)
-			} else if hello.OP == 10 {
-				fmt.Println("Hello event processed")
-				return
-			}
+	for {
+		_, message, err := connection.ReadMessage()
+		if err != nil {
+			fmt.Println("read:", err)
 		}
-	}()
+		err = json.Unmarshal(message, &hello)
+		if err != nil {
+			fmt.Println("Something has gone bad bad very bad", err)
+		} else if hello.OP == 10 {
+			fmt.Println("Hello event processed")
+			break
+		}
+	}
 
-	go func() {
-		time.Sleep(time.Duration(float64(hello.D.HeartbeatInterval)*rand.Float64()) * time.Millisecond)
-		fmt.Println("initial heartbeat")
-		heartbeaterr := connection.WriteMessage(websocket.TextMessage, []byte(`{"op":1,"d":null}`))
+	return hello.D.HeartbeatInterval, connection
+}
+
+func resume_connection() {
+	fmt.Println("tbc")
+}
+
+func heartbeat(heartbeat_interval int, connection *websocket.Conn) {
+	time.Sleep(time.Duration(float64(heartbeat_interval)*rand.Float64()) * time.Millisecond)
+	fmt.Println("initial heartbeat")
+	heartbeaterr := connection.WriteMessage(websocket.TextMessage, []byte(`{"op":1,"d":null}`))
+
+	if heartbeaterr != nil {
+		fmt.Println("Technically this is handling the error")
+	}
+
+	sleep_duration := time.Duration(float64(heartbeat_interval)) * time.Millisecond
+
+	for {
+		time.Sleep(sleep_duration)
+		if atomic.LoadInt32(&heartbeatrecieved) == 0 {
+			println("At this point, this is where you know its over.")
+			return
+		}
+		var heartbeaterr error
+		fmt.Println("sending heartbeat")
+		if atomic.LoadInt64(&sequencenumber) == 0 {
+			heartbeaterr = connection.WriteMessage(websocket.TextMessage, []byte(`{"op":1,"d":null}`))
+		} else {
+			heartbeaterr = connection.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"op":1,"d":%d}`, atomic.LoadInt64(&sequencenumber))))
+		}
 		if heartbeaterr != nil {
 			fmt.Println("Technically this is handling the error")
 		}
+		atomic.StoreInt32(&heartbeatrecieved, 0)
+	}
+}
 
-		for {
-			time.Sleep(time.Duration(float64(hello.D.HeartbeatInterval)) * time.Millisecond)
-
-			if atomic.LoadInt32(&heartbeatrecieved) == 0 {
-				println("At this point, this is where you know its over.")
-				return
-			}
-
+func event_handler(connection *websocket.Conn) {
+	for {
+		var event struct {
+			OP int `json:"op"`
+			D  struct {
+				APIVERSION int    `json:"v"`
+				SESSIONID  string `json:"session_id"`
+				RESUMEURL  string `json:"resume_gateway_url"`
+				USER       struct {
+					USERNAME      string `json:"username"`
+					DISCRIMINATOR string `json:"discriminator"`
+				} `json:"user"`
+				GUILDS []struct {
+					ID          string `json:"id"`
+					UNAVAILABLE bool   `json:"guilds"`
+				} `json:"guilds"`
+				CONTENT   string `json:"content"`
+				CHANNELID string `json:"channel_id"`
+			} `json:"d"`
+			S int    `json:"s"`
+			T string `json:"t"`
+		}
+		readerr := connection.ReadJSON(&event)
+		if readerr != nil {
+			fmt.Println("Idk not my problem (actually it is my problem)", readerr)
+			return
+		}
+		switch event.OP {
+		case 11:
+			atomic.StoreInt32(&heartbeatrecieved, 1)
+			fmt.Println("heartbeat recieved")
+		case 1:
+			fmt.Println("Spanish Inquisition apparently")
 			var heartbeaterr error
-			fmt.Println("sending heartbeat")
 			if atomic.LoadInt64(&sequencenumber) == 0 {
 				heartbeaterr = connection.WriteMessage(websocket.TextMessage, []byte(`{"op":1,"d":null}`))
 			} else {
-				heartbeaterr = connection.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"op":1,"d":%d}`, atomic.LoadInt64(&sequencenumber))))
+				heartbeaterr = connection.WriteMessage(websocket.TextMessage, fmt.Appendf(nil, `{"op":1,"d":%d}`, atomic.LoadInt64(&sequencenumber)))
 			}
 			if heartbeaterr != nil {
 				fmt.Println("Technically this is handling the error")
 			}
-			atomic.StoreInt32(&heartbeatrecieved, 0)
-		}
-	}()
-
-	// Reading loop below:
-	go func() {
-		for {
-			var event struct {
-				OP int `json:"op"`
-				D  struct {
-					APIVERSION int    `json:"v"`
-					SESSIONID  string `json:"session_id"`
-					RESUMEURL  string `json:"resume_gateway_url"`
-					USER       struct {
-						USERNAME      string `json:"username"`
-						DISCRIMINATOR string `json:"discriminator"`
-					} `json:"user"`
-					GUILDS []struct {
-						ID          string `json:"id"`
-						UNAVAILABLE bool   `json:"guilds"`
-					} `json:"guilds"`
-					CONTENT   string `json:"content"`
-					CHANNELID string `json:"channel_id"`
-				} `json:"d"`
-				S int    `json:"s"`
-				T string `json:"t"`
-			}
-			readerr := connection.ReadJSON(&event)
-			if readerr != nil {
-				fmt.Println("Idk not my problem (actually it is my problem)", readerr)
-				return
-			}
-
-			switch event.OP {
-			case 11:
-				atomic.StoreInt32(&heartbeatrecieved, 1)
-				fmt.Println("heartbeat recieved")
-			case 1:
-				fmt.Println("Spanish Inquisition apparently")
-				var heartbeaterr error
-				if atomic.LoadInt64(&sequencenumber) == 0 {
-					heartbeaterr = connection.WriteMessage(websocket.TextMessage, []byte(`{"op":1,"d":null}`))
-				} else {
-					heartbeaterr = connection.WriteMessage(websocket.TextMessage, fmt.Appendf(nil, `{"op":1,"d":%d}`, atomic.LoadInt64(&sequencenumber)))
+		case 0:
+			fmt.Println(event.T)
+			if event.T == "READY" {
+				apiversion = event.D.APIVERSION
+				session_id = event.D.SESSIONID
+				resume_gateway_url = event.D.RESUMEURL
+				for _, guild := range event.D.GUILDS {
+					fmt.Println(guild.ID)
+					guilds = append(guilds, guild.ID)
 				}
-
-				if heartbeaterr != nil {
-					fmt.Println("Technically this is handling the error")
-				}
-			case 0:
-				fmt.Println(event.T)
-				if event.T == "READY" {
-					apiversion = event.D.APIVERSION
-					session_id = event.D.SESSIONID
-					resume_gateway_url = event.D.RESUMEURL
-					for _, guild := range event.D.GUILDS {
-						fmt.Println(guild.ID)
-						guilds = append(guilds, guild.ID)
+				fmt.Printf("Signed in as %v#%v\n", event.D.USER.USERNAME, event.D.USER.DISCRIMINATOR)
+			} else if event.T == "MESSAGE_CREATE" {
+				fmt.Println(event.D.CONTENT)
+				if event.D.CONTENT == "e" {
+					var message struct {
+						CONTENT string `json:"content"`
 					}
-					fmt.Printf("Signed in as %v#%v\n", event.D.USER.USERNAME, event.D.USER.DISCRIMINATOR)
-				} else if event.T == "MESSAGE_CREATE" {
-					fmt.Println(event.D.CONTENT)
-					if event.D.CONTENT == "e" {
-						var message struct {
-							CONTENT string `json:"content"`
-						}
-						message.CONTENT = "Hello?"
-						jsonmessage, jsonerr := json.Marshal(message)
-						if jsonerr != nil {
-							fmt.Println("Failed to convert message to json.")
-						}
-						request, httperr := http.NewRequest("POST", ("https://discord.com/api/channels/" + event.D.CHANNELID + "/messages"), strings.NewReader(string(jsonmessage)))
-						if httperr != nil {
-							fmt.Println("Http Error")
-						}
-						request.Header.Set("Content-Type", "application/json")
-						request.Header.Set("Authorization", ("Bot " + token))
-						request.Header.Set("User-Agent", useragent)
-
-						response, httperr = http.DefaultClient.Do(request)
-						if httperr != nil {
-							fmt.Println("Failed to send message")
-						}
-
-						if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusCreated {
-							fmt.Printf("Failed to send message: %s\n", response.Status)
-						} else {
-							fmt.Println("Message sent successfully!")
-						}
-						response.Body.Close()
+					message.CONTENT = "e"
+					jsonmessage, jsonerr := json.Marshal(message)
+					if jsonerr != nil {
+						fmt.Println("Failed to convert message to json.")
 					}
+					request, httperr := http.NewRequest("POST", ("https://discord.com/api/channels/" + event.D.CHANNELID + "/messages"), strings.NewReader(string(jsonmessage)))
+					if httperr != nil {
+						fmt.Println("Http Error")
+					}
+					request.Header.Set("Content-Type", "application/json")
+					request.Header.Set("Authorization", ("Bot " + token))
+					request.Header.Set("User-Agent", useragent)
+					response, httperr := http.DefaultClient.Do(request)
+					if httperr != nil {
+						fmt.Println("Failed to send message")
+					}
+					if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusCreated {
+						fmt.Printf("Failed to send message: %s\n", response.Status)
+					} else {
+						fmt.Println("Message sent successfully!")
+					}
+					response.Body.Close()
 				}
-			case 9:
-				fmt.Println("Invalid Session Error Has occured")
-
 			}
-			fmt.Println("Event Confirmed; OP CODE:", event.OP)
-
-			if event.S != 0 {
-				atomic.StoreInt64(&sequencenumber, int64(event.S))
-				fmt.Println("Sequence Updated", sequencenumber)
-			}
-
+		case 9:
+			fmt.Println("Invalid Session Error Has occured")
 		}
-	}()
+		fmt.Println("Event Confirmed; OP CODE:", event.OP)
+		if event.S != 0 {
+			atomic.StoreInt64(&sequencenumber, int64(event.S))
+			fmt.Println("Sequence Updated", sequencenumber)
+		}
+	}
+}
+
+func main() {
+	defer fmt.Println("Program exited")
+	get_gateway()
+	heartbeat_interval, connection := open_connection()
+	go heartbeat(heartbeat_interval, connection)
+	go event_handler(connection)
 
 	var identifypayload struct {
 		OP int `json:"op"`
@@ -255,6 +254,8 @@ func main() {
 	if err != nil {
 		fmt.Println("its so over")
 	}
+
+	defer connection.Close()
 
 	for {
 		time.Sleep(500)
