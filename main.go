@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/rand"
+	"math/rand/v2"
 	"net/http"
 	"os"
+	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -32,10 +34,46 @@ var gateway struct {
 	URL string `json:"url"`
 }
 
+var lastMessageId string
+
+var wg sync.WaitGroup
+
+var stopChan = make(chan struct{})
+var resume_procedure uint8 //1: Restart connection completely, 2: resume connection with url.
+
+func terminate(i uint8, connection *websocket.Conn) {
+	close(stopChan)
+	if i == 0 {
+		fmt.Println("OHDEAR I = 0")
+	}
+	resume_procedure = i
+	wg.Wait()
+	connection.Close()
+	fmt.Println("Connection was terminated but like in  a good way")
+	fmt.Println("Goroutines running:", runtime.NumGoroutine())
+}
+
+func get_error(err error) uint8 {
+	if closeErr, ok := err.(*websocket.CloseError); ok {
+		fmt.Printf("Recieved close code: %v", closeErr.Code)
+		switch closeErr.Code {
+		case 4000, 4001, 4002, 4003, 4004, 4005, 4007, 4008, 4009:
+			return 2
+		default:
+			fmt.Println("Unknown CloseErr")
+			return 1
+		}
+	} else {
+		fmt.Println("Unknown websocket error", err)
+		return 0
+	}
+}
+
 func get_gateway() {
 	response, err := http.Get("https://discord.com/api/gateway")
 	if err != nil {
 		fmt.Println("Request to discord servers failed.")
+		os.Exit(1)
 	}
 
 	defer response.Body.Close()
@@ -46,20 +84,23 @@ func get_gateway() {
 	}
 	if err != nil {
 		fmt.Println(err)
+		os.Exit(1)
 	}
 
 	err = json.Unmarshal(body, &gateway)
 
 	if err != nil {
 		fmt.Println(err)
+		os.Exit(1)
 	}
 }
 
-func open_connection() (int, *websocket.Conn) {
-	connection, _, err := websocket.DefaultDialer.Dial(gateway.URL+"/?v=10&encoding=json", nil)
+func open_connection(url string) (int, *websocket.Conn) {
+	connection, _, err := websocket.DefaultDialer.Dial(url+"/?v=10&encoding=json", nil)
 
 	if err != nil {
 		fmt.Println("Failed to connect to gateway :(")
+		os.Exit(1)
 	}
 
 	fmt.Println("Connected to discord gateway")
@@ -75,6 +116,7 @@ func open_connection() (int, *websocket.Conn) {
 		_, message, err := connection.ReadMessage()
 		if err != nil {
 			fmt.Println("read:", err)
+			os.Exit(1)
 		}
 		err = json.Unmarshal(message, &hello)
 		if err != nil {
@@ -88,43 +130,76 @@ func open_connection() (int, *websocket.Conn) {
 	return hello.D.HeartbeatInterval, connection
 }
 
-func resume_connection() {
-	fmt.Println("tbc")
+func resume_event(connection *websocket.Conn) bool {
+	var res_payload struct {
+		OP int `json:"op"`
+		D  struct {
+			TOKEN  string `json:"token"`
+			SESSID string `json:"session_id"`
+			SEQ    int    `json:"seq"`
+		} `json:"d"`
+	}
+	res_payload.OP = 6
+	res_payload.D.TOKEN = token
+	res_payload.D.SESSID = session_id
+	res_payload.D.SEQ = int(sequencenumber)
+	err := connection.WriteJSON(res_payload)
+	if err != nil {
+		return false
+	}
+	return true
 }
 
 func heartbeat(heartbeat_interval int, connection *websocket.Conn) {
-	time.Sleep(time.Duration(float64(heartbeat_interval)*rand.Float64()) * time.Millisecond)
-	fmt.Println("initial heartbeat")
-	heartbeaterr := connection.WriteMessage(websocket.TextMessage, []byte(`{"op":1,"d":null}`))
+	ticker := time.NewTicker(time.Duration(float64(heartbeat_interval)*rand.Float64()) * time.Millisecond)
+	defer ticker.Stop()
 
-	if heartbeaterr != nil {
-		fmt.Println("Technically this is handling the error")
-	}
+	select {
+	case <-stopChan:
+		fmt.Println("Stopped INSTANTLY :0")
+		return
+	case <-ticker.C:
+		fmt.Println("initial heartbeat")
+		heartbeaterr := connection.WriteMessage(websocket.TextMessage, []byte(`{"op":1,"d":null}`))
 
-	sleep_duration := time.Duration(float64(heartbeat_interval)) * time.Millisecond
-
-	for {
-		time.Sleep(sleep_duration)
-		if atomic.LoadInt32(&heartbeatrecieved) == 0 {
-			println("At this point, this is where you know its over.")
+		if heartbeaterr != nil {
+			fmt.Println("I don't know what this error is:", heartbeaterr)
 			return
 		}
-		var heartbeaterr error
-		fmt.Println("sending heartbeat")
-		if atomic.LoadInt64(&sequencenumber) == 0 {
-			heartbeaterr = connection.WriteMessage(websocket.TextMessage, []byte(`{"op":1,"d":null}`))
-		} else {
-			heartbeaterr = connection.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"op":1,"d":%d}`, atomic.LoadInt64(&sequencenumber))))
+	}
+
+	ticker = time.NewTicker(time.Duration(float64(heartbeat_interval)) * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-stopChan:
+			return
+		case <-ticker.C:
+			if atomic.LoadInt32(&heartbeatrecieved) == 0 {
+				println("At this point, this is where you know its over.")
+				terminate(2, connection)
+				return
+			}
+			var heartbeaterr error
+			fmt.Println("sending heartbeat")
+			if atomic.LoadInt64(&sequencenumber) == 0 {
+				heartbeaterr = connection.WriteMessage(websocket.TextMessage, []byte(`{"op":1,"d":null}`))
+			} else {
+				heartbeaterr = connection.WriteMessage(websocket.TextMessage, fmt.Appendf(nil, `{"op":1,"d":%d}`, atomic.LoadInt64(&sequencenumber)))
+			}
+			if heartbeaterr != nil {
+				terminate(get_error(heartbeaterr), connection)
+				return
+			}
+			atomic.StoreInt32(&heartbeatrecieved, 0)
 		}
-		if heartbeaterr != nil {
-			fmt.Println("Technically this is handling the error")
-		}
-		atomic.StoreInt32(&heartbeatrecieved, 0)
 	}
 }
 
 func event_handler(connection *websocket.Conn) {
 	for {
+		print(1)
 		var event struct {
 			OP int `json:"op"`
 			D  struct {
@@ -136,18 +211,19 @@ func event_handler(connection *websocket.Conn) {
 					DISCRIMINATOR string `json:"discriminator"`
 				} `json:"user"`
 				GUILDS []struct {
-					ID          string `json:"id"`
-					UNAVAILABLE bool   `json:"guilds"`
+					ID        string `json:"id"`
+					UNAGUILDS bool   `json:"guilds"`
 				} `json:"guilds"`
 				CONTENT   string `json:"content"`
 				CHANNELID string `json:"channel_id"`
+				ID        string `json:"id"`
 			} `json:"d"`
 			S int    `json:"s"`
 			T string `json:"t"`
 		}
 		readerr := connection.ReadJSON(&event)
 		if readerr != nil {
-			fmt.Println("Idk not my problem (actually it is my problem)", readerr)
+			terminate(get_error(readerr), connection)
 			return
 		}
 		switch event.OP {
@@ -163,11 +239,13 @@ func event_handler(connection *websocket.Conn) {
 				heartbeaterr = connection.WriteMessage(websocket.TextMessage, fmt.Appendf(nil, `{"op":1,"d":%d}`, atomic.LoadInt64(&sequencenumber)))
 			}
 			if heartbeaterr != nil {
-				fmt.Println("Technically this is handling the error")
+				terminate(get_error(readerr), connection)
+				return
 			}
 		case 0:
 			fmt.Println(event.T)
-			if event.T == "READY" {
+			switch event.T {
+			case "READY":
 				apiversion = event.D.APIVERSION
 				session_id = event.D.SESSIONID
 				resume_gateway_url = event.D.RESUMEURL
@@ -176,13 +254,15 @@ func event_handler(connection *websocket.Conn) {
 					guilds = append(guilds, guild.ID)
 				}
 				fmt.Printf("Signed in as %v#%v\n", event.D.USER.USERNAME, event.D.USER.DISCRIMINATOR)
-			} else if event.T == "MESSAGE_CREATE" {
+			case "MESSAGE_CREATE":
 				fmt.Println(event.D.CONTENT)
-				if event.D.CONTENT == "e" {
+				if event.D.ID == lastMessageId {
+					fmt.Println("Still resuming i guess...")
+				} else if event.D.CONTENT == "e" {
 					var message struct {
 						CONTENT string `json:"content"`
 					}
-					message.CONTENT = "e"
+					message.CONTENT = "UwU"
 					jsonmessage, jsonerr := json.Marshal(message)
 					if jsonerr != nil {
 						fmt.Println("Failed to convert message to json.")
@@ -203,11 +283,21 @@ func event_handler(connection *websocket.Conn) {
 					} else {
 						fmt.Println("Message sent successfully!")
 					}
+					lastMessageId = event.D.ID
 					response.Body.Close()
+					terminate(2, connection)
+					return
 				}
+				lastMessageId = event.D.ID
 			}
 		case 9:
-			fmt.Println("Invalid Session Error Has occured")
+			fmt.Println("Invalid Session Error Has occured -- Re-Identifying")
+			//not even gonna bother with the potential for reconnection
+			terminate(1, connection)
+			return
+		case 7:
+			terminate(2, connection)
+			return
 		}
 		fmt.Println("Event Confirmed; OP CODE:", event.OP)
 		if event.S != 0 {
@@ -217,13 +307,7 @@ func event_handler(connection *websocket.Conn) {
 	}
 }
 
-func main() {
-	defer fmt.Println("Program exited")
-	get_gateway()
-	heartbeat_interval, connection := open_connection()
-	go heartbeat(heartbeat_interval, connection)
-	go event_handler(connection)
-
+func identify(connection *websocket.Conn) {
 	var identifypayload struct {
 		OP int `json:"op"`
 		D  struct {
@@ -242,22 +326,84 @@ func main() {
 	identifypayload.D.PROPERTIES.OS = "linux"
 	identifypayload.D.PROPERTIES.BROWSER = "my_library"
 	identifypayload.D.PROPERTIES.DEVICE = "my_library"
+	identifypayload.D.TOKEN = token
+	err := connection.WriteJSON(identifypayload)
+	if err != nil {
+		fmt.Println("its so over - quitting since if the identify fails then its all joever")
+		os.Exit(1)
+	}
+
+}
+
+func main() {
+	defer fmt.Println("Program exited")
+	get_gateway()
+	heartbeat_interval, connection := open_connection(gateway.URL)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		heartbeat(heartbeat_interval, connection)
+	}()
+
+	go event_handler(connection)
 
 	tokendata, err := os.ReadFile("token.txt")
 	if err != nil {
 		fmt.Println("Error reading token file. Set token in token.txt.")
+		os.Exit(1)
 	}
-	identifypayload.D.TOKEN = string(tokendata)
+
 	token = string(tokendata)
 
-	err = connection.WriteJSON(identifypayload)
-	if err != nil {
-		fmt.Println("its so over")
-	}
-
+	identify(connection)
+	fmt.Println("Goroutines running:", runtime.NumGoroutine())
 	defer connection.Close()
-
 	for {
-		time.Sleep(500)
+		print(runtime.NumGoroutine())
+		<-stopChan
+		print("Connection was terminated oh deary me", resume_procedure)
+		stopChan = make(chan struct{})
+
+		time.Sleep(time.Duration(2) * time.Millisecond)
+		wg.Wait()
+		print(2)
+		switch resume_procedure {
+		case 0:
+			fmt.Println("An unknown error has occured")
+			os.Exit(1)
+		case 1:
+			sequencenumber = 0
+			heartbeat_interval, connection = open_connection(gateway.URL)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				heartbeat(heartbeat_interval, connection)
+			}()
+			go event_handler(connection)
+			identify(connection)
+		case 2:
+			fmt.Println("Attempting Resuming of connection")
+			heartbeat_interval, connection = open_connection(resume_gateway_url)
+			resumed := resume_event(connection)
+			if resumed == false {
+				heartbeat_interval, connection = open_connection(gateway.URL)
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					heartbeat(heartbeat_interval, connection)
+				}()
+				go event_handler(connection)
+				identify(connection)
+			} else {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					heartbeat(heartbeat_interval, connection)
+				}()
+				go event_handler(connection)
+			}
+
+		}
 	}
 }
